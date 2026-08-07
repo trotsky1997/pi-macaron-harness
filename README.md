@@ -1,4 +1,4 @@
-# pi-macaron-websearch
+# pi-macaron-harness
 
 A [Pi](https://github.com/badlogic/pi-mono) custom provider extension that enables
 **Anthropic-native server-side `web_search`** (and full pass-through of `web_fetch` /
@@ -26,7 +26,7 @@ never have to echo raw server-tool blocks back to the API.
 ## Install
 
 ```bash
-pi install git:github.com/trotsky1997/pi-macaron-websearch
+pi install git:github.com/trotsky1997/pi-macaron-harness
 ```
 
 > Requires a `macaron-anthropic` provider entry in `~/.pi/agent/models.json`
