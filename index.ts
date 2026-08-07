@@ -652,7 +652,10 @@ function pipeFilters(input: string, filters: { grep?: string; sed?: string; awk?
 	let current = input;
 	for (const { tool, arg } of steps) {
 		const r = spawnSync(tool, [arg], { input: current, encoding: "utf8", shell: false, maxBuffer: 64 * 1024 * 1024 });
-		if (r.error || r.status !== 0) {
+		if (r.error) throw new Error(`${tool} filter failed: ${r.error.message}`);
+		// grep exit 1 = no matches (empty result, not an error); exit 2+ = real error.
+		// sed/awk exit 0 = success, anything else = error.
+		if (r.status !== 0 && !(tool === "grep" && r.status === 1)) {
 			const err = (r.stderr || "").trim() || `exit ${r.status}`;
 			throw new Error(`${tool} filter failed: ${err}`);
 		}
