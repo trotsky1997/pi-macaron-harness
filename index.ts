@@ -51,7 +51,6 @@ import TurndownService from "turndown";
 import { Readability } from "@mozilla/readability";
 import { JSDOM } from "jsdom";
 import { readFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -640,42 +639,29 @@ async function fetchUrl(url: string, maxLength: number, keepImages: boolean, kee
 	return body;
 }
 
-/** Pipe text through grep / sed / awk (in that order, only the ones given).
- *  Each runs as its own process; text flows via stdin. Uses sh -c so quoting
- *  follows POSIX shell rules. */
-function pipeFilters(input: string, filters: { grep?: string; sed?: string; awk?: string }): string {
-	const steps: { tool: string; arg: string }[] = [];
-	if (filters.grep && filters.grep.trim()) steps.push({ tool: "grep", arg: filters.grep });
-	if (filters.sed && filters.sed.trim()) steps.push({ tool: "sed", arg: filters.sed });
-	if (filters.awk && filters.awk.trim()) steps.push({ tool: "awk", arg: filters.awk });
-	if (steps.length === 0) return input;
-	let current = input;
-	for (const { tool, arg } of steps) {
-		const r = spawnSync(tool, [arg], { input: current, encoding: "utf8", shell: false, maxBuffer: 64 * 1024 * 1024 });
-		if (r.error) throw new Error(`${tool} filter failed: ${r.error.message}`);
-		// grep exit 1 = no matches (empty result, not an error); exit 2+ = real error.
-		// sed/awk exit 0 = success, anything else = error.
-		if (r.status !== 0 && !(tool === "grep" && r.status === 1)) {
-			const err = (r.stderr || "").trim() || `exit ${r.status}`;
-			throw new Error(`${tool} filter failed: ${err}`);
-		}
-		current = (r.stdout ?? "").replace(/\n$/, "");
-	}
-	return current;
+/** Grep the fetched body: keep only matching lines. Pattern is treated as
+ *  a (grep -E style) regex; if it fails to compile, falls back to literal
+ *  substring match. No binary dependency. Returns matching lines joined by
+ *  newlines, or empty when nothing matches (never throws on no-match). */
+function grepFilter(input: string, pattern: string): string {
+	if (!pattern.trim()) return input;
+	let re: RegExp;
+	try { re = new RegExp(pattern, "i"); } catch { re = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"); }
+	const lines = input.split("\n");
+	const matched = lines.filter((line) => re.test(line));
+	return matched.join("\n");
 }
 
 const clientWebFetchTool = defineTool({
 	name: "web_fetch",
 	label: "Web Fetch (client-side)",
 	description:
-		"Fetch a single URL and return its text content (HTML is converted to clean Markdown via Readability+Turndown). By default images and link URLs are stripped (anchor text kept) to save tokens — set keep_images=true and/or keep_links=true to preserve them. Optional grep/sed/awk filters are applied to the fetched body in that order (grep → sed → awk), each receiving the body via stdin. Returns the (filtered) body text, truncated to max_length.",
-	promptSnippet: "web_fetch(url, grep?, sed?, awk?, keep_images?, keep_links?): fetch a URL, optionally filter and control media/link stripping.",
+		"Fetch a single URL and return its text content (HTML is converted to clean Markdown via Readability+Turndown). By default images and link URLs are stripped (anchor text kept) to save tokens — set keep_images=true and/or keep_links=true to preserve them. Optional grep pattern keeps only matching lines of the fetched body (piped via stdin). Returns the (grep-filtered) body text, truncated to max_length.",
+	promptSnippet: "web_fetch(url, grep?, keep_images?, keep_links?): fetch a URL, optionally grep-filter and control media/link stripping.",
 	parameters: Type.Object({
 		url: Type.String({ description: "The absolute URL to fetch (http/https)." }),
 		max_length: Type.Optional(Type.Number({ description: "Max chars to return (default 8000)." })),
 		grep: Type.Optional(Type.String({ description: "Optional grep pattern. Only matching lines of the fetched body are kept (body piped via stdin)." })),
-		sed: Type.Optional(Type.String({ description: "Optional sed expression applied to the (grep-filtered) body, e.g. 's/foo/bar/g'." })),
-		awk: Type.Optional(Type.String({ description: "Optional awk program applied last, e.g. '{print $1}' or '/pattern/{print}'." })),
 		keep_images: Type.Optional(Type.Boolean({ description: "Keep images in output (default false = strip). Override PI_WEBFETCH_KEEP_IMAGES env." })),
 		keep_links: Type.Optional(Type.Boolean({ description: "Keep link URLs in output as [text](url) (default false = strip URLs, keep anchor text). Override PI_WEBFETCH_KEEP_LINKS env." })),
 	}),
@@ -685,10 +671,10 @@ const clientWebFetchTool = defineTool({
 			const keepImages = params.keep_images ?? envFlag("PI_WEBFETCH_KEEP_IMAGES", false);
 			const keepLinks = params.keep_links ?? envFlag("PI_WEBFETCH_KEEP_LINKS", false);
 			let body = await fetchUrl(params.url, max, keepImages, keepLinks);
-			if (params.grep || params.sed || params.awk) {
-				body = pipeFilters(body, { grep: params.grep, sed: params.sed, awk: params.awk });
+			if (params.grep) {
+				body = grepFilter(body, params.grep);
 			}
-			return { content: [{ type: "text" as const, text: body }], details: { url: params.url, length: body.length, keep_images: keepImages, keep_links: keepLinks, grep: params.grep, sed: params.sed, awk: params.awk } as any };
+			return { content: [{ type: "text" as const, text: body }], details: { url: params.url, length: body.length, keep_images: keepImages, keep_links: keepLinks, grep: params.grep } as any };
 		} catch (e: any) {
 			return { content: [{ type: "text" as const, text: `web_fetch failed: ${e?.message || String(e)}` }], details: { url: params.url, error: e?.message } as any, isError: true };
 		}
