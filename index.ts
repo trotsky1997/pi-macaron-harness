@@ -45,8 +45,7 @@ import {
 	type ToolCall,
 	type ToolResultMessage,
 } from "@mariozechner/pi-ai";
-import { defineTool, type ExtensionAPI, type ProviderConfig } from "@mariozechner/pi-coding-agent";
-import { Type } from "@mariozechner/pi-ai";
+import type { ExtensionAPI, ProviderConfig } from "@mariozechner/pi-coding-agent";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -347,13 +346,9 @@ type MyBlock = (TextContent | ThinkingContent | ToolCall) & {
 	srvName?: string;
 };
 
-// Set from models.json at load time so the stream function and the active
-// search tool know the endpoint + whether it expects Authorization: Bearer
-// (authHeader:true) or x-api-key.
+// Set from models.json at load time so the stream function knows whether the
+// endpoint expects Authorization: Bearer (authHeader:true) or x-api-key.
 let PROVIDER_AUTH_HEADER = false;
-let PROVIDER_BASE_URL = "";
-let PROVIDER_API_KEY = "";
-let PROVIDER_MODEL_ID = "";
 
 function streamMacaronWebSearch(
 	model: Model<Api>,
@@ -550,85 +545,6 @@ function streamMacaronWebSearch(
 }
 
 // ---------------------------------------------------------------------------
-// active search tool: lets the pi agent (or user) trigger a one-shot
-// server-side web_search against the macaron endpoint, outside the main
-// conversation turn. Returns the model's answer (incl. the search query used).
-// NOTE: the macaron endpoint strips web_search_tool_result.content, so the
-// returned value is the model's answer text, not a list of source links.
-// ---------------------------------------------------------------------------
-
-async function runActiveWebSearch(query: string, maxUses = 5): Promise<{ text: string; queries: string[] }> {
-	const apiKey = PROVIDER_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || "";
-	if (!apiKey) throw new Error("No API key available for active web search");
-	if (!PROVIDER_BASE_URL) throw new Error("Provider baseUrl not initialized");
-	if (!PROVIDER_MODEL_ID) throw new Error("Provider model id not initialized");
-
-	const betaFeatures = ["fine-grained-tool-streaming-2025-05-14", "interleaved-thinking-2025-05-14"];
-	const client = new Anthropic({
-		apiKey: PROVIDER_AUTH_HEADER ? null : apiKey,
-		authToken: PROVIDER_AUTH_HEADER ? apiKey : undefined,
-		baseURL: PROVIDER_BASE_URL,
-		dangerouslyAllowBrowser: true,
-		defaultHeaders: { accept: "application/json", "anthropic-dangerous-direct-browser-access": "true", "anthropic-beta": betaFeatures.join(",") },
-	});
-
-	const res = await client.messages.create({
-		model: PROVIDER_MODEL_ID,
-		max_tokens: 1024,
-		messages: [{ role: "user", content: `Use the web_search tool to search the web for: "${query}". Then answer the user's question concisely using the search results. Query: ${query}` }],
-		tools: [{ type: process.env.PI_WEBSEARCH_TOOL_TYPE || "web_search_20250305", name: "web_search", max_uses: maxUses } as any],
-	});
-
-	const queries: string[] = [];
-	const parts: string[] = [];
-	for (const b of (res.content || [])) {
-		const blk = b as any;
-		if (blk.type === "server_tool_use" && blk.name === "web_search") {
-			const q = blk.input?.query;
-			if (typeof q === "string" && q.trim()) queries.push(q);
-		} else if (blk.type === "web_search_tool_result") {
-			const arr = Array.isArray(blk.content) ? blk.content : [];
-			parts.push(`\n[web_search_tool_result] ${arr.length ? arr.length + " result(s)" : "(endpoint did not return result bodies)"}\n`);
-		} else if (blk.type === "thinking" && typeof blk.thinking === "string" && blk.thinking.trim()) {
-			parts.push(`[thinking] ${blk.thinking.trim()}\n`);
-		} else if (blk.type === "text" && typeof blk.text === "string" && blk.text.trim()) {
-			parts.push(blk.text.trim());
-		}
-	}
-	let text = parts.join("\n\n").trim();
-	if (queries.length) text = `🔎 searched: ${queries.map((q) => `"${q}"`).join(", ")}\n\n` + text;
-	if (!text) text = "(no output)";
-	return { text, queries };
-}
-
-const macaronWebSearchTool = defineTool({
-	name: "macaron_web_search",
-	label: "Macaron Web Search",
-	description:
-		"Trigger a one-shot Anthropic-native server-side web_search against the macaron endpoint and return the model's answer. Use this to actively search the web for live/time-sensitive information (prices, dates, latest versions, news) without relying on the model to spontaneously decide to search. Returns the search query used plus the model's answer based on real search results. Note: the macaron endpoint may not return result source links, only the answer.",
-	promptSnippet: "macaron_web_search(query): actively trigger a server-side web search and return the answer.",
-	parameters: Type.Object({
-		query: Type.String({ description: "The search query / question to look up live." }),
-		max_uses: Type.Optional(Type.Number({ description: "Max number of searches (default 5)." })),
-	}),
-	async execute(_toolCallId, params, signal) {
-		try {
-			const { text, queries } = await runActiveWebSearch(params.query, params.max_uses ?? 5);
-			return {
-				content: [{ type: "text" as const, text }],
-				details: { query: params.query, ranQueries: queries } as any,
-			};
-		} catch (e: any) {
-			return {
-				content: [{ type: "text" as const, text: `macaron_web_search failed: ${e?.message || String(e)}` }],
-				details: { error: e?.message } as any,
-				isError: true,
-			};
-		}
-	},
-});
-
-// ---------------------------------------------------------------------------
 // entry point: re-register macaron-anthropic under a dedicated api name
 // ---------------------------------------------------------------------------
 
@@ -658,9 +574,6 @@ export default function (pi: ExtensionAPI) {
 	// anthropic-messages handler stays untouched. models.json remains the
 	// source of truth for baseUrl / apiKey / model list.
 	PROVIDER_AUTH_HEADER = existing.authHeader === true;
-	PROVIDER_BASE_URL = existing.baseUrl;
-	PROVIDER_API_KEY = existing.apiKey;
-	PROVIDER_MODEL_ID = (existing.models || [])[0]?.id || "";
 	const config: ProviderConfig = {
 		baseUrl: existing.baseUrl,
 		apiKey: existing.apiKey,
@@ -680,5 +593,4 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerProvider(providerName, config as any);
-	pi.registerTool(macaronWebSearchTool);
 }
