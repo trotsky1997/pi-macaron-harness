@@ -45,7 +45,8 @@ import {
 	type ToolCall,
 	type ToolResultMessage,
 } from "@mariozechner/pi-ai";
-import type { ExtensionAPI, ProviderConfig } from "@mariozechner/pi-coding-agent";
+import { defineTool, type ExtensionAPI, type ProviderConfig } from "@mariozechner/pi-coding-agent";
+import { Type } from "@mariozechner/pi-ai";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -545,6 +546,82 @@ function streamMacaronWebSearch(
 }
 
 // ---------------------------------------------------------------------------
+// client-side web_fetch tool
+//
+// The macaron endpoint does NOT auto-execute web_fetch server-side: when the
+// web_fetch tool is present the model emits a plain tool_use (name=web_fetch)
+// and stops, waiting for the client to return the page content. With no
+// executor that stalls the turn. This client-side tool performs the fetch
+// locally (HTTP + naive HTML->text) and returns the body, so the agent can
+// actually read URLs. (On a real Anthropic endpoint that supports server-side
+// web_fetch, disable this and inject the server tool via PI_TOOL_WEB_FETCH=1
+// instead — the formatWebFetchResult parser already covers that path.)
+// ---------------------------------------------------------------------------
+
+const HTML_ENTITIES: Record<string, string> = {
+	"&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'", "&nbsp;": " ", "&apos;": "'",
+};
+function decodeEntities(s: string): string {
+	return s.replace(/&[a-zA-Z#0-9]+;/g, (m) => HTML_ENTITIES[m] ?? m);
+}
+
+function htmlToText(html: string): string {
+	// drop non-content blocks
+	let s = html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ");
+	// block-level tags -> newlines
+	s = s.replace(/<\s*(\/?)\s*(p|div|section|article|li|ul|ol|h[1-6]|br|tr|td|th|table|header|footer|nav|main|blockquote|pre)[^>]*>/gi, (_, close) => (close ? "\n" : "\n"));
+	// strip remaining tags
+	s = s.replace(/<[^>]+>/g, " ");
+	s = decodeEntities(s);
+	// collapse whitespace
+	s = s.replace(/[ \t\f\v]+/g, " ").replace(/\n\s*\n+/g, "\n\n").trim();
+	return s;
+}
+
+async function fetchUrl(url: string, maxLength: number): Promise<string> {
+	const res = await fetch(url, {
+		redirect: "follow",
+		headers: {
+			"user-agent": "Mozilla/5.0 (compatible; pi-webfetch/1.0)",
+			accept: "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.5",
+		},
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+	const ctype = (res.headers.get("content-type") || "").toLowerCase();
+	const raw = await res.text();
+	let body: string;
+	if (ctype.includes("application/json") || ctype.includes("text/plain")) {
+		body = raw;
+	} else {
+		body = htmlToText(raw);
+	}
+	body = body.trim();
+	if (body.length > maxLength) body = body.slice(0, maxLength) + `\n…[truncated ${body.length - maxLength} chars]`;
+	return body;
+}
+
+const clientWebFetchTool = defineTool({
+	name: "web_fetch",
+	label: "Web Fetch (client-side)",
+	description:
+		"Fetch a single URL and return its text content (HTML is converted to plain text, scripts/styles stripped). Use this to read a specific page when you already know the URL. Returns the page body text, truncated to a length you can control. (On this endpoint web_fetch runs client-side because the server does not auto-execute it.)",
+	promptSnippet: "web_fetch(url): fetch a URL and return its text content.",
+	parameters: Type.Object({
+		url: Type.String({ description: "The absolute URL to fetch (http/https)." }),
+		max_length: Type.Optional(Type.Number({ description: "Max chars to return (default 8000)." })),
+	}),
+	async execute(_toolCallId, params, _signal) {
+		try {
+			const max = params.max_length ?? Number(process.env.PI_WEBFETCH_MAX_CHARS ?? 8000);
+			const body = await fetchUrl(params.url, max);
+			return { content: [{ type: "text" as const, text: body }], details: { url: params.url, length: body.length } as any };
+		} catch (e: any) {
+			return { content: [{ type: "text" as const, text: `web_fetch failed: ${e?.message || String(e)}` }], details: { url: params.url, error: e?.message } as any, isError: true };
+		}
+	},
+});
+
+// ---------------------------------------------------------------------------
 // entry point: re-register macaron-anthropic under a dedicated api name
 // ---------------------------------------------------------------------------
 
@@ -593,4 +670,12 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerProvider(providerName, config as any);
+
+	// Client-side web_fetch: the endpoint doesn't auto-execute it server-side,
+	// so we provide a real fetch executor. Default on; disable with
+	// PI_WEBFETCH_CLIENT=0. (Don't enable PI_TOOL_WEB_FETCH at the same time,
+	// which injects the server tool — names would clash.)
+	if (toolEnabled("PI_WEBFETCH_CLIENT", true)) {
+		pi.registerTool(clientWebFetchTool);
+	}
 }
