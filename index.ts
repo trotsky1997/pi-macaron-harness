@@ -51,6 +51,7 @@ import TurndownService from "turndown";
 import { Readability } from "@mozilla/readability";
 import { JSDOM } from "jsdom";
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -639,21 +640,48 @@ async function fetchUrl(url: string, maxLength: number): Promise<string> {
 	return body;
 }
 
+/** Pipe text through grep / sed / awk (in that order, only the ones given).
+ *  Each runs as its own process; text flows via stdin. Uses sh -c so quoting
+ *  follows POSIX shell rules. */
+function pipeFilters(input: string, filters: { grep?: string; sed?: string; awk?: string }): string {
+	const steps: { tool: string; arg: string }[] = [];
+	if (filters.grep && filters.grep.trim()) steps.push({ tool: "grep", arg: filters.grep });
+	if (filters.sed && filters.sed.trim()) steps.push({ tool: "sed", arg: filters.sed });
+	if (filters.awk && filters.awk.trim()) steps.push({ tool: "awk", arg: filters.awk });
+	if (steps.length === 0) return input;
+	let current = input;
+	for (const { tool, arg } of steps) {
+		const r = spawnSync(tool, [arg], { input: current, encoding: "utf8", shell: false, maxBuffer: 64 * 1024 * 1024 });
+		if (r.error || r.status !== 0) {
+			const err = (r.stderr || "").trim() || `exit ${r.status}`;
+			throw new Error(`${tool} filter failed: ${err}`);
+		}
+		current = (r.stdout ?? "").replace(/\n$/, "");
+	}
+	return current;
+}
+
 const clientWebFetchTool = defineTool({
 	name: "web_fetch",
 	label: "Web Fetch (client-side)",
 	description:
-		"Fetch a single URL and return its text content (HTML is converted to plain text, scripts/styles stripped). Use this to read a specific page when you already know the URL. Returns the page body text, truncated to a length you can control. (On this endpoint web_fetch runs client-side because the server does not auto-execute it.)",
-	promptSnippet: "web_fetch(url): fetch a URL and return its text content.",
+		"Fetch a single URL and return its text content (HTML is converted to clean Markdown via Readability+Turndown; images and link URLs are stripped by default). Use this to read a specific page when you already know the URL. Optional grep/sed/awk filters are applied to the fetched body in that order (grep → sed → awk), each receiving the body via stdin — handy to extract only matching lines, do substitutions, or pull columns without a second tool call. Returns the (filtered) body text, truncated to max_length.",
+	promptSnippet: "web_fetch(url, grep?, sed?, awk?): fetch a URL, optionally filter with grep/sed/awk.",
 	parameters: Type.Object({
 		url: Type.String({ description: "The absolute URL to fetch (http/https)." }),
 		max_length: Type.Optional(Type.Number({ description: "Max chars to return (default 8000)." })),
+		grep: Type.Optional(Type.String({ description: "Optional grep pattern. Only matching lines of the fetched body are kept (body piped via stdin)." })),
+		sed: Type.Optional(Type.String({ description: "Optional sed expression applied to the (grep-filtered) body, e.g. 's/foo/bar/g'." })),
+		awk: Type.Optional(Type.String({ description: "Optional awk program applied last, e.g. '{print $1}' or '/pattern/{print}'." })),
 	}),
 	async execute(_toolCallId, params, _signal) {
 		try {
 			const max = params.max_length ?? Number(process.env.PI_WEBFETCH_MAX_CHARS ?? 8000);
-			const body = await fetchUrl(params.url, max);
-			return { content: [{ type: "text" as const, text: body }], details: { url: params.url, length: body.length } as any };
+			let body = await fetchUrl(params.url, max);
+			if (params.grep || params.sed || params.awk) {
+				body = pipeFilters(body, { grep: params.grep, sed: params.sed, awk: params.awk });
+			}
+			return { content: [{ type: "text" as const, text: body }], details: { url: params.url, length: body.length, grep: params.grep, sed: params.sed, awk: params.awk } as any };
 		} catch (e: any) {
 			return { content: [{ type: "text" as const, text: `web_fetch failed: ${e?.message || String(e)}` }], details: { url: params.url, error: e?.message } as any, isError: true };
 		}
