@@ -26,7 +26,7 @@ never have to echo raw server-tool blocks back to the API.
 ## Install
 
 ```bash
-pi install git:github.com/trots/pi-macaron-websearch
+pi install git:github.com/trotsky1997/pi-macaron-websearch
 ```
 
 > Requires a `macaron-anthropic` provider entry in `~/.pi/agent/models.json`
