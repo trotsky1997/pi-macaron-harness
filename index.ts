@@ -569,7 +569,23 @@ const turndown = new TurndownService({
 	bulletListMarker: "-",
 	emDelimiter: "*",
 });
+// Strip noise by default: drop images and turn links into plain text (drop the
+// URL, keep the anchor text). Saves tokens and avoids link-spam clutter.
+// Set PI_WEBFETCH_KEEP_LINKS=1 to keep ![alt](url) and [text](url) as-is.
 turndown.remove(["script", "style", "noscript", "iframe", "svg", "canvas", "template"]);
+if (!keepLinks()) {
+	turndown.addRule("stripImages", { filter: "img", replacement: () => "" });
+	turndown.addRule("stripPicture", { filter: "picture", replacement: () => "" });
+	turndown.addRule("stripLinkUrls", {
+		filter: (node) => node.nodeName === "A" && node.getAttribute("href") != null,
+		replacement: (content) => content,
+	});
+}
+
+function keepLinks(): boolean {
+	const v = (process.env.PI_WEBFETCH_KEEP_LINKS ?? "0").trim().toLowerCase();
+	return v === "1" || v === "true" || v === "yes" || v === "on";
+}
 
 function readabilityEnabled(): boolean {
 	const v = (process.env.PI_WEBFETCH_READABILITY ?? "1").trim().toLowerCase();
