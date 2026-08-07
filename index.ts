@@ -562,30 +562,29 @@ function streamMacaronWebSearch(
 // instead — the formatWebFetchResult parser already covers that path.)
 // ---------------------------------------------------------------------------
 
-// shared turndown instance — strips script/style/noscript and converts HTML to
-// clean Markdown. bun ships a DOMParser so turndown works with no extra deps.
-const turndown = new TurndownService({
-	headingStyle: "atx",
-	codeBlockStyle: "fenced",
-	bulletListMarker: "-",
-	emDelimiter: "*",
-});
 // Strip noise by default: drop images and turn links into plain text (drop the
 // URL, keep the anchor text). Saves tokens and avoids link-spam clutter.
-// Set PI_WEBFETCH_KEEP_LINKS=1 to keep ![alt](url) and [text](url) as-is.
-turndown.remove(["script", "style", "noscript", "iframe", "svg", "canvas", "template"]);
-if (!keepLinks()) {
-	turndown.addRule("stripImages", { filter: "img", replacement: () => "" });
-	turndown.addRule("stripPicture", { filter: "picture", replacement: () => "" });
-	turndown.addRule("stripLinkUrls", {
-		filter: (node) => node.nodeName === "A" && node.getAttribute("href") != null,
-		replacement: (content) => content,
-	});
+// Per-call `keep_images` / `keep_links` params (and PI_WEBFETCH_KEEP_IMAGES /
+// PI_WEBFETCH_KEEP_LINKS env as defaults) toggle each independently.
+function envFlag(name: string, def = false): boolean {
+	const v = (process.env[name] ?? (def ? "1" : "0")).trim().toLowerCase();
+	return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
-function keepLinks(): boolean {
-	const v = (process.env.PI_WEBFETCH_KEEP_LINKS ?? "0").trim().toLowerCase();
-	return v === "1" || v === "true" || v === "yes" || v === "on";
+function makeTurndown(keepImages: boolean, keepLinks: boolean): TurndownService {
+	const td = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced", bulletListMarker: "-", emDelimiter: "*" });
+	td.remove(["script", "style", "noscript", "iframe", "svg", "canvas", "template"]);
+	if (!keepImages) {
+		td.addRule("stripImages", { filter: "img", replacement: () => "" });
+		td.addRule("stripPicture", { filter: "picture", replacement: () => "" });
+	}
+	if (!keepLinks) {
+		td.addRule("stripLinkUrls", {
+			filter: (node) => node.nodeName === "A" && node.getAttribute("href") != null,
+			replacement: (content) => content,
+		});
+	}
+	return td;
 }
 
 function readabilityEnabled(): boolean {
@@ -598,27 +597,28 @@ function readabilityEnabled(): boolean {
 // page with Turndown. Readability is skipped for non-article pages (lists,
 // dashboards) where it would drop too much — a too-short extraction triggers
 // the fallback automatically.
-function htmlToMarkdown(html: string, url: string): string {
+function htmlToMarkdown(html: string, url: string, keepImages: boolean, keepLinks: boolean): string {
+	const td = makeTurndown(keepImages, keepLinks);
 	if (readabilityEnabled()) {
 		try {
 			const doc = new JSDOM(html, { url }).window.document;
 			const article = new Readability(doc, { charThreshold: 200 }).parse();
 			if (article?.content && article.content.replace(/<[^>]+>/g, "").trim().length > 200) {
-				return turndown.turndown(article.content).trim();
+				return td.turndown(article.content).trim();
 			}
 		} catch {
 			// fall through to full-page turndown
 		}
 	}
 	try {
-		return turndown.turndown(html).trim();
+		return td.turndown(html).trim();
 	} catch {
 		// last resort: crude tag-strip
 		return html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 	}
 }
 
-async function fetchUrl(url: string, maxLength: number): Promise<string> {
+async function fetchUrl(url: string, maxLength: number, keepImages: boolean, keepLinks: boolean): Promise<string> {
 	const res = await fetch(url, {
 		redirect: "follow",
 		headers: {
@@ -633,7 +633,7 @@ async function fetchUrl(url: string, maxLength: number): Promise<string> {
 	if (ctype.includes("application/json") || ctype.includes("text/plain")) {
 		body = raw;
 	} else {
-		body = htmlToMarkdown(raw, url);
+		body = htmlToMarkdown(raw, url, keepImages, keepLinks);
 	}
 	body = body.trim();
 	if (body.length > maxLength) body = body.slice(0, maxLength) + `\n…[truncated ${body.length - maxLength} chars]`;
@@ -665,23 +665,27 @@ const clientWebFetchTool = defineTool({
 	name: "web_fetch",
 	label: "Web Fetch (client-side)",
 	description:
-		"Fetch a single URL and return its text content (HTML is converted to clean Markdown via Readability+Turndown; images and link URLs are stripped by default). Use this to read a specific page when you already know the URL. Optional grep/sed/awk filters are applied to the fetched body in that order (grep → sed → awk), each receiving the body via stdin — handy to extract only matching lines, do substitutions, or pull columns without a second tool call. Returns the (filtered) body text, truncated to max_length.",
-	promptSnippet: "web_fetch(url, grep?, sed?, awk?): fetch a URL, optionally filter with grep/sed/awk.",
+		"Fetch a single URL and return its text content (HTML is converted to clean Markdown via Readability+Turndown). By default images and link URLs are stripped (anchor text kept) to save tokens — set keep_images=true and/or keep_links=true to preserve them. Optional grep/sed/awk filters are applied to the fetched body in that order (grep → sed → awk), each receiving the body via stdin. Returns the (filtered) body text, truncated to max_length.",
+	promptSnippet: "web_fetch(url, grep?, sed?, awk?, keep_images?, keep_links?): fetch a URL, optionally filter and control media/link stripping.",
 	parameters: Type.Object({
 		url: Type.String({ description: "The absolute URL to fetch (http/https)." }),
 		max_length: Type.Optional(Type.Number({ description: "Max chars to return (default 8000)." })),
 		grep: Type.Optional(Type.String({ description: "Optional grep pattern. Only matching lines of the fetched body are kept (body piped via stdin)." })),
 		sed: Type.Optional(Type.String({ description: "Optional sed expression applied to the (grep-filtered) body, e.g. 's/foo/bar/g'." })),
 		awk: Type.Optional(Type.String({ description: "Optional awk program applied last, e.g. '{print $1}' or '/pattern/{print}'." })),
+		keep_images: Type.Optional(Type.Boolean({ description: "Keep images in output (default false = strip). Override PI_WEBFETCH_KEEP_IMAGES env." })),
+		keep_links: Type.Optional(Type.Boolean({ description: "Keep link URLs in output as [text](url) (default false = strip URLs, keep anchor text). Override PI_WEBFETCH_KEEP_LINKS env." })),
 	}),
 	async execute(_toolCallId, params, _signal) {
 		try {
 			const max = params.max_length ?? Number(process.env.PI_WEBFETCH_MAX_CHARS ?? 8000);
-			let body = await fetchUrl(params.url, max);
+			const keepImages = params.keep_images ?? envFlag("PI_WEBFETCH_KEEP_IMAGES", false);
+			const keepLinks = params.keep_links ?? envFlag("PI_WEBFETCH_KEEP_LINKS", false);
+			let body = await fetchUrl(params.url, max, keepImages, keepLinks);
 			if (params.grep || params.sed || params.awk) {
 				body = pipeFilters(body, { grep: params.grep, sed: params.sed, awk: params.awk });
 			}
-			return { content: [{ type: "text" as const, text: body }], details: { url: params.url, length: body.length, grep: params.grep, sed: params.sed, awk: params.awk } as any };
+			return { content: [{ type: "text" as const, text: body }], details: { url: params.url, length: body.length, keep_images: keepImages, keep_links: keepLinks, grep: params.grep, sed: params.sed, awk: params.awk } as any };
 		} catch (e: any) {
 			return { content: [{ type: "text" as const, text: `web_fetch failed: ${e?.message || String(e)}` }], details: { url: params.url, error: e?.message } as any, isError: true };
 		}
