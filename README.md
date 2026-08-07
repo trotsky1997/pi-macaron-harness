@@ -58,3 +58,4 @@ when your endpoint truly supports server-side execution.
 | `PI_CODEEXEC_TOOL_TYPE` | `code_execution_20250522` | tool type override |
 | `PI_SERVER_TOOL_RESULT_MAX_CHARS` | `8000` | per-result-block truncation |
 | `PI_MACARON_PROVIDER` | `macaron-anthropic` | provider name to wrap |
+| `PI_MIN_IMAGE_DIM` | `256` | upscale images whose smaller edge is below this before sending to the vision endpoint (avoids rejections of tiny images like 40×40 avatars); `0` disables |

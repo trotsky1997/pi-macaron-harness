@@ -53,6 +53,7 @@ import { JSDOM } from "jsdom";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import sharp from "sharp";
 
 // ---------------------------------------------------------------------------
 // helpers (mirror the built-in anthropic provider so behavior stays faithful
@@ -67,23 +68,62 @@ function normalizeToolCallId(id: string): string {
 	return id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
 }
 
-function convertContentBlocks(content: (TextContent | ImageContent)[]) {
+// Minimum image edge length sent to the vision endpoint. Very small images
+// (e.g. 40x40 avatars) get rejected by the vision service; we upscale them so
+// the request goes through. 0 disables. Override via PI_MIN_IMAGE_DIM.
+function minImageDim(): number {
+	const n = Number(process.env.PI_MIN_IMAGE_DIM ?? 256);
+	return Number.isFinite(n) && n > 0 ? Math.floor(n) : 256;
+}
+
+// Upscale so the smaller edge >= minImageDim (only when below). Passes
+// through untouched if sharp can't decode it or the image is already big.
+async function maybeUpscaleImage(data: string, mimeType: string): Promise<{ data: string; mimeType: string }> {
+	const min = minImageDim();
+	if (min <= 0) return { data, mimeType };
+	let buf: Buffer;
+	try {
+		buf = Buffer.from(data, "base64");
+	} catch {
+		return { data, mimeType };
+	}
+	try {
+		const meta = await sharp(buf).metadata();
+		if (meta.width && meta.height && Math.min(meta.width, meta.height) >= min) {
+			return { data, mimeType };
+		}
+		const out = await sharp(buf)
+			.resize({ width: min, height: min, fit: "outside", withoutEnlargement: false })
+			.png()
+			.toBuffer();
+		return { data: out.toString("base64"), mimeType: "image/png" };
+	} catch {
+		// not a decodable image, or sharp failed — pass through untouched
+		return { data, mimeType };
+	}
+}
+
+async function convertContentBlocks(content: (TextContent | ImageContent)[]) {
 	const hasImages = content.some((c) => c.type === "image");
 	if (!hasImages) {
 		return sanitizeSurrogates(content.map((c) => (c as TextContent).text).join("\n"));
 	}
-	const blocks = content.map((block) =>
-		block.type === "text"
-			? { type: "text" as const, text: sanitizeSurrogates(block.text) }
-			: { type: "image" as const, source: { type: "base64" as const, media_type: block.mimeType, data: block.data } },
-	);
+	const blocks: any[] = [];
+	for (const block of content) {
+		if (block.type === "text") {
+			blocks.push({ type: "text" as const, text: sanitizeSurrogates(block.text) });
+		} else {
+			const img = await maybeUpscaleImage(block.data, block.mimeType);
+			blocks.push({ type: "image" as const, source: { type: "base64" as const, media_type: img.mimeType, data: img.data } });
+		}
+	}
 	if (!blocks.some((b) => b.type === "text")) {
 		blocks.unshift({ type: "text" as const, text: "(see attached image)" });
 	}
 	return blocks;
 }
 
-function convertMessages(messages: Message[]): any[] {
+async function convertMessages(messages: Message[]): Promise<any[]> {
 	const params: any[] = [];
 	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i];
@@ -92,14 +132,17 @@ function convertMessages(messages: Message[]): any[] {
 			if (typeof msg.content === "string") {
 				if (msg.content.trim()) params.push({ role: "user", content: sanitizeSurrogates(msg.content) });
 			} else {
-				const blocks = msg.content
-					.map((item) =>
-						item.type === "text"
-							? { type: "text" as const, text: sanitizeSurrogates(item.text) }
-							: { type: "image" as const, source: { type: "base64" as const, media_type: item.mimeType, data: item.data } },
-					)
-					.filter((b) => (b.type === "text" ? b.text.trim().length > 0 : true));
-				if (blocks.length > 0) params.push({ role: "user", content: blocks });
+				const blocks: any[] = [];
+				for (const item of msg.content) {
+					if (item.type === "text") {
+						blocks.push({ type: "text" as const, text: sanitizeSurrogates(item.text) });
+					} else {
+						const img = await maybeUpscaleImage(item.data, item.mimeType);
+						blocks.push({ type: "image" as const, source: { type: "base64" as const, media_type: img.mimeType, data: img.data } });
+					}
+				}
+				const filtered = blocks.filter((b) => (b.type === "text" ? b.text.trim().length > 0 : true));
+				if (filtered.length > 0) params.push({ role: "user", content: filtered });
 			}
 		} else if (msg.role === "assistant") {
 			const blocks: any[] = [];
@@ -125,13 +168,13 @@ function convertMessages(messages: Message[]): any[] {
 			const toolResults: any[] = [{
 				type: "tool_result",
 				tool_use_id: normalizeToolCallId((msg as ToolResultMessage).toolCallId),
-				content: convertContentBlocks((msg as ToolResultMessage).content),
+				content: await convertContentBlocks((msg as ToolResultMessage).content),
 				is_error: (msg as ToolResultMessage).isError,
 			}];
 			let j = i + 1;
 			while (j < messages.length && messages[j].role === "toolResult") {
 				const n = messages[j] as ToolResultMessage;
-				toolResults.push({ type: "tool_result", tool_use_id: normalizeToolCallId(n.toolCallId), content: convertContentBlocks(n.content), is_error: n.isError });
+				toolResults.push({ type: "tool_result", tool_use_id: normalizeToolCallId(n.toolCallId), content: await convertContentBlocks(n.content), is_error: n.isError });
 				j++;
 			}
 			i = j - 1;
@@ -399,7 +442,7 @@ function streamMacaronWebSearch(
 			// build params (faithful to built-in buildParams, api-key path)
 			const params: any = {
 				model: model.id,
-				messages: convertMessages(context.messages),
+				messages: await convertMessages(context.messages),
 				max_tokens: options?.maxTokens || Math.min(model.maxTokens || 32000, 32000),
 				stream: true,
 			};
