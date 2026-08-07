@@ -48,6 +48,8 @@ import {
 import { defineTool, type ExtensionAPI, type ProviderConfig } from "@mariozechner/pi-coding-agent";
 import { Type } from "@mariozechner/pi-ai";
 import TurndownService from "turndown";
+import { Readability } from "@mozilla/readability";
+import { JSDOM } from "jsdom";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -569,11 +571,32 @@ const turndown = new TurndownService({
 });
 turndown.remove(["script", "style", "noscript", "iframe", "svg", "canvas", "template"]);
 
-function htmlToMarkdown(html: string): string {
+function readabilityEnabled(): boolean {
+	const v = (process.env.PI_WEBFETCH_READABILITY ?? "1").trim().toLowerCase();
+	return !(v === "0" || v === "false" || v === "no" || v === "off");
+}
+
+// Convert HTML to Markdown. Tries Readability first (strips nav/sidebars/
+// ads/footers, keeps article body), then falls back to converting the whole
+// page with Turndown. Readability is skipped for non-article pages (lists,
+// dashboards) where it would drop too much — a too-short extraction triggers
+// the fallback automatically.
+function htmlToMarkdown(html: string, url: string): string {
+	if (readabilityEnabled()) {
+		try {
+			const doc = new JSDOM(html, { url }).window.document;
+			const article = new Readability(doc, { charThreshold: 200 }).parse();
+			if (article?.content && article.content.replace(/<[^>]+>/g, "").trim().length > 200) {
+				return turndown.turndown(article.content).trim();
+			}
+		} catch {
+			// fall through to full-page turndown
+		}
+	}
 	try {
 		return turndown.turndown(html).trim();
 	} catch {
-		// fall back to a crude tag-strip if turndown chokes on malformed input
+		// last resort: crude tag-strip
 		return html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 	}
 }
@@ -593,7 +616,7 @@ async function fetchUrl(url: string, maxLength: number): Promise<string> {
 	if (ctype.includes("application/json") || ctype.includes("text/plain")) {
 		body = raw;
 	} else {
-		body = htmlToMarkdown(raw);
+		body = htmlToMarkdown(raw, url);
 	}
 	body = body.trim();
 	if (body.length > maxLength) body = body.slice(0, maxLength) + `\n…[truncated ${body.length - maxLength} chars]`;
