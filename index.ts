@@ -47,6 +47,7 @@ import {
 } from "@mariozechner/pi-ai";
 import { defineTool, type ExtensionAPI, type ProviderConfig } from "@mariozechner/pi-coding-agent";
 import { Type } from "@mariozechner/pi-ai";
+import TurndownService from "turndown";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -558,24 +559,23 @@ function streamMacaronWebSearch(
 // instead — the formatWebFetchResult parser already covers that path.)
 // ---------------------------------------------------------------------------
 
-const HTML_ENTITIES: Record<string, string> = {
-	"&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'", "&nbsp;": " ", "&apos;": "'",
-};
-function decodeEntities(s: string): string {
-	return s.replace(/&[a-zA-Z#0-9]+;/g, (m) => HTML_ENTITIES[m] ?? m);
-}
+// shared turndown instance — strips script/style/noscript and converts HTML to
+// clean Markdown. bun ships a DOMParser so turndown works with no extra deps.
+const turndown = new TurndownService({
+	headingStyle: "atx",
+	codeBlockStyle: "fenced",
+	bulletListMarker: "-",
+	emDelimiter: "*",
+});
+turndown.remove(["script", "style", "noscript", "iframe", "svg", "canvas", "template"]);
 
-function htmlToText(html: string): string {
-	// drop non-content blocks
-	let s = html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ");
-	// block-level tags -> newlines
-	s = s.replace(/<\s*(\/?)\s*(p|div|section|article|li|ul|ol|h[1-6]|br|tr|td|th|table|header|footer|nav|main|blockquote|pre)[^>]*>/gi, (_, close) => (close ? "\n" : "\n"));
-	// strip remaining tags
-	s = s.replace(/<[^>]+>/g, " ");
-	s = decodeEntities(s);
-	// collapse whitespace
-	s = s.replace(/[ \t\f\v]+/g, " ").replace(/\n\s*\n+/g, "\n\n").trim();
-	return s;
+function htmlToMarkdown(html: string): string {
+	try {
+		return turndown.turndown(html).trim();
+	} catch {
+		// fall back to a crude tag-strip if turndown chokes on malformed input
+		return html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+	}
 }
 
 async function fetchUrl(url: string, maxLength: number): Promise<string> {
@@ -593,7 +593,7 @@ async function fetchUrl(url: string, maxLength: number): Promise<string> {
 	if (ctype.includes("application/json") || ctype.includes("text/plain")) {
 		body = raw;
 	} else {
-		body = htmlToText(raw);
+		body = htmlToMarkdown(raw);
 	}
 	body = body.trim();
 	if (body.length > maxLength) body = body.slice(0, maxLength) + `\n…[truncated ${body.length - maxLength} chars]`;
