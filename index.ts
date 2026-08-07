@@ -617,7 +617,56 @@ function htmlToMarkdown(html: string, url: string, keepImages: boolean, keepLink
 	}
 }
 
-async function fetchUrl(url: string, maxLength: number, keepImages: boolean, keepLinks: boolean): Promise<string> {
+// ---------------------------------------------------------------------------
+// fetch + cache
+//
+// Caches the converted body (post-Readability/Turndown, pre-truncation) keyed
+// by url + keep_images + keep_links, so repeated calls for the same page with
+// different grep/max_length reuse one fetch. In-memory LRU + TTL. Only HTTP
+// 2xx results are cached; errors and non-cacheable responses are not. Knobs:
+// PI_WEBFETCH_CACHE=0 disables, PI_WEBFETCH_CACHE_TTL (s, default 3600),
+// PI_WEBFETCH_CACHE_MAX (entries, default 100).
+// ---------------------------------------------------------------------------
+
+type CacheEntry = { body: string; ts: number };
+const fetchCache = new Map<string, CacheEntry>();
+
+function cacheEnabled(): boolean {
+	const v = (process.env.PI_WEBFETCH_CACHE ?? "1").trim().toLowerCase();
+	return !(v === "0" || v === "false" || v === "no" || v === "off");
+}
+function cacheTtl(): number { return Math.max(0, Number(process.env.PI_WEBFETCH_CACHE_TTL ?? 3600) || 3600); }
+function cacheMax(): number { return Math.max(1, Number(process.env.PI_WEBFETCH_CACHE_MAX ?? 100) || 100); }
+
+function cacheKey(url: string, keepImages: boolean, keepLinks: boolean): string {
+	return `${url}|${keepImages ? 1 : 0}${keepLinks ? 1 : 0}`;
+}
+
+function cacheGet(key: string): string | undefined {
+	if (!cacheEnabled()) return undefined;
+	const e = fetchCache.get(key);
+	if (!e) return undefined;
+	if (Date.now() - e.ts > cacheTtl() * 1000) { fetchCache.delete(key); return undefined; }
+	// LRU: refresh recency by re-inserting (Map preserves insertion order).
+	fetchCache.delete(key); fetchCache.set(key, e);
+	return e.body;
+}
+
+function cacheSet(key: string, body: string) {
+	if (!cacheEnabled()) return;
+	fetchCache.set(key, { body, ts: Date.now() });
+	while (fetchCache.size > cacheMax()) {
+		const oldest = fetchCache.keys().next().value;
+		if (oldest === undefined) break;
+		fetchCache.delete(oldest);
+	}
+}
+
+/** Fetch + convert to Markdown (no truncation, no grep). Cached. */
+async function fetchBody(url: string, keepImages: boolean, keepLinks: boolean): Promise<string> {
+	const key = cacheKey(url, keepImages, keepLinks);
+	const hit = cacheGet(key);
+	if (hit !== undefined) return hit;
 	const res = await fetch(url, {
 		redirect: "follow",
 		headers: {
@@ -635,6 +684,12 @@ async function fetchUrl(url: string, maxLength: number, keepImages: boolean, kee
 		body = htmlToMarkdown(raw, url, keepImages, keepLinks);
 	}
 	body = body.trim();
+	if (res.ok) cacheSet(key, body);
+	return body;
+}
+
+async function fetchUrl(url: string, maxLength: number, keepImages: boolean, keepLinks: boolean): Promise<string> {
+	let body = await fetchBody(url, keepImages, keepLinks);
 	if (body.length > maxLength) body = body.slice(0, maxLength) + `\n…[truncated ${body.length - maxLength} chars]`;
 	return body;
 }
@@ -656,7 +711,7 @@ const clientWebFetchTool = defineTool({
 	name: "web_fetch",
 	label: "Web Fetch (client-side)",
 	description:
-		"Fetch a single URL and return its text content (HTML is converted to clean Markdown via Readability+Turndown). By default images and link URLs are stripped (anchor text kept) to save tokens — set keep_images=true and/or keep_links=true to preserve them. Optional grep pattern keeps only matching lines of the fetched body (piped via stdin). Returns the (grep-filtered) body text, truncated to max_length.",
+		"Fetch a single URL and return its text content (HTML is converted to clean Markdown via Readability+Turndown). Responses are cached in-memory (LRU+TTL) keyed by url+keep_images+keep_links, so repeated calls with different grep/max_length reuse one fetch. By default images and link URLs are stripped (anchor text kept) to save tokens — set keep_images=true and/or keep_links=true to preserve them. Optional grep pattern keeps only matching lines of the fetched body. Returns the (grep-filtered) body text, truncated to max_length.",
 	promptSnippet: "web_fetch(url, grep?, keep_images?, keep_links?): fetch a URL, optionally grep-filter and control media/link stripping.",
 	parameters: Type.Object({
 		url: Type.String({ description: "The absolute URL to fetch (http/https)." }),
@@ -738,4 +793,28 @@ export default function (pi: ExtensionAPI) {
 	if (toolEnabled("PI_WEBFETCH_CLIENT", true)) {
 		pi.registerTool(clientWebFetchTool);
 	}
+
+	// /webfetch-cache: inspect or clear the web_fetch response cache.
+	//   /webfetch-cache              -> show entry count + sample keys
+	//   /webfetch-cache clear        -> drop all cached entries
+	pi.registerCommand("webfetch-cache", {
+		description: "Inspect or clear the web_fetch response cache (arg: clear)",
+		handler: async (args, ctx) => {
+			const arg = (args || "").trim().toLowerCase();
+			if (arg === "clear" || arg === "flush" || arg === "reset") {
+				const n = fetchCache.size;
+				fetchCache.clear();
+				if (ctx?.hasUI) ctx.ui.notify(`web_fetch cache cleared (${n} entries)`, "info");
+				return { content: [{ type: "text", text: `Cleared ${n} cached entries.` }] };
+			}
+			const keys = Array.from(fetchCache.keys());
+			const lines = [`web_fetch cache: ${fetchCache.size} entries (ttl=${cacheTtl()}s, max=${cacheMax()})`];
+			for (const k of keys.slice(0, 10)) {
+				const e = fetchCache.get(k)!;
+				const age = Math.round((Date.now() - e.ts) / 1000);
+				lines.push(`  ${age}s ago  ${k.slice(0, 90)}`);
+			}
+			return { content: [{ type: "text", text: lines.join("\n") }] };
+		},
+	});
 }
