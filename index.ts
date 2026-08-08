@@ -357,13 +357,19 @@ interface Segment {
 // Flatten a request params object into an ordered segment array (preorder).
 // Order matters: system first, then tools (schema-stable across turns), then
 // messages (append-mostly, but mid-message inserts/deletes are the hazard).
+// All segments hash via stableStringify (recursive key sort) so the detection
+// layer matches the canonicalize() stabilization layer: key-order drift that
+// canonicalize already neutralized won't fire a false break signal here.
 function buildSegments(params: any): Segment[] {
 	const segs: Segment[] = [];
-	if (params.system) segs.push({ kind: "system", label: "system", hash: shortHash(JSON.stringify(params.system)) });
+	if (params.system) segs.push({ kind: "system", label: "system", hash: shortHash(stableStringify(params.system)) });
 	if (Array.isArray(params.tools)) {
 		for (let i = 0; i < params.tools.length; i++) {
 			const t = params.tools[i];
-			segs.push({ kind: "tool", label: `tool[${i}]:${t.name || "?"}`, hash: shortHash(JSON.stringify({ n: t.name, s: t.input_schema ?? t })) });
+			// Hash the full tool (name + description + input_schema) so any measured
+			// cache-breaking change (order, count, 1-char desc, schema key order)
+			// surfaces as a front break here.
+			segs.push({ kind: "tool", label: `tool[${i}]:${t.name || "?"}`, hash: shortHash(stableStringify(t)) });
 		}
 	}
 	if (Array.isArray(params.messages)) {
