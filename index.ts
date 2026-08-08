@@ -244,25 +244,25 @@ function convertMessages(messages: Message[], model: Model<Api>): any[] {
 		}
 	}
 
-	// cache_control on last user message
-	if (params.length > 0) {
-		const last = params[params.length - 1];
-		if (last.role === "user" && Array.isArray(last.content)) {
-			const lb = last.content[last.content.length - 1];
-			if (lb && (lb.type === "text" || lb.type === "image" || lb.type === "tool_result")) {
-				lb.cache_control = { type: "ephemeral" };
-			}
-		}
-	}
+	// No cache_control markers here. Measured on the macaron endpoint: the
+	// marker has NO effect (block-level auto cache ignores it), and marking the
+	// last user message made its position drift every turn anyway. See
+	// notes/pi-macaron-harness-cache-real-behavior.
 	return params;
 }
 
 function convertTools(tools: Tool[]): any[] {
-	return tools.map((tool) => ({
-		name: tool.name,
-		description: tool.description,
-		input_schema: { type: "object", properties: (tool.parameters as any).properties || {}, required: (tool.parameters as any).required || [] },
-	}));
+	// Sort tools by name for byte-stable tools-array prefix. Measured on the
+	// macaron endpoint: tools array ORDER swap breaks the cache (cacheRead→0),
+	// while system/message-layer changes do not. Pi core may deliver context.tools
+	// in a different order across turns, so we normalize here.
+	return tools
+		.map((tool) => ({
+			name: tool.name,
+			description: tool.description,
+			input_schema: { type: "object", properties: (tool.parameters as any).properties || {}, required: (tool.parameters as any).required || [] },
+		}))
+		.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -666,7 +666,9 @@ function streamMacaronWebSearch(
 				stream: true,
 			};
 			if (context.systemPrompt) {
-				params.system = [{ type: "text", text: sanitizeSurrogates(context.systemPrompt), cache_control: { type: "ephemeral" } }];
+				// cache_control omitted: measured to have NO effect on the macaron endpoint
+				// (block-level auto cache ignores the marker; see cache-affinity notes).
+				params.system = [{ type: "text", text: sanitizeSurrogates(context.systemPrompt) }];
 			}
 			if (options?.temperature !== undefined && !(options?.reasoning && model.reasoning)) {
 				params.temperature = options.temperature;
@@ -674,6 +676,9 @@ function streamMacaronWebSearch(
 			const toolsArr: any[] = context.tools ? convertTools(context.tools) : [];
 			// inject Anthropic-native server-side tools (web_search / web_fetch / code_execution)
 			for (const t of buildServerTools()) toolsArr.push(t);
+			// Re-sort the merged array: server tools + client tools must be in a stable
+			// order across turns or the cache prefix breaks (measured on the endpoint).
+			toolsArr.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 			params.tools = toolsArr;
 
 			if (model.reasoning) {
