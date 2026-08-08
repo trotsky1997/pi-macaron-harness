@@ -1125,6 +1125,35 @@ export default function (pi: ExtensionAPI) {
 		pi.registerTool(clientWebFetchTool);
 	}
 
+	// turn_end: notify the user when a prefix-cache break was detected this turn.
+	// cacheStats is updated inside streamMacaronWebSearch.analyzePrefix (runs
+	// only for macaron turns), so we just read it here and surface a notify +
+	// status line when a real break (front/mid) happened. Dedup by turnIndex so
+	// a sustained break doesn't re-notify every turn.
+	if (process.env.PI_MACARON_CACHE_STATUS !== "0") {
+		let lastNotifiedTurn = -1;
+		pi.on("turn_end", async (event, ctx) => {
+			const turn = (event as any).turnIndex ?? 0;
+			// Only the macaron streamSimple updates cacheStats; if this turn didn't
+			// touch it (non-macaron provider, or watch disabled), skip silently.
+			if (cacheStats.turns === 0 || turn === lastNotifiedTurn) return;
+			const cat = cacheStats.lastBreakCategory;
+			if (cat === "first" || cat === "none" || cat === "tail") {
+				if (ctx?.hasUI) ctx.ui.setStatus("macaron-cache", undefined);
+				return;
+			}
+			// Real break: front (head/system+tools changed — silent killer) or mid
+			// (message-layer instability). Notify once per turn.
+			lastNotifiedTurn = turn;
+			const sym = cat === "front" ? "⚡" : "◳";
+			const msg = `macaron cache break ${sym} ${cat} @ ${cacheStats.lastBreakIdx}/${cacheStats.lastSegmentCount} → ${cacheStats.lastBreakLabel}`;
+			if (ctx?.hasUI) {
+				ctx.ui.setStatus("macaron-cache", ctx.ui.theme.fg(cat === "front" ? "error" : "warning", `macaron ${sym}${cat}`));
+				ctx.ui.notify(msg, cat === "front" ? "error" : "warning");
+			}
+		});
+	}
+
 	// /webfetch-cache: inspect or clear the web_fetch response cache.
 	//   /webfetch-cache              -> show entry count + sample keys
 	//   /webfetch-cache clear        -> drop all cached entries
