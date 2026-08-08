@@ -67,6 +67,102 @@ function normalizeToolCallId(id: string): string {
 	return id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
 }
 
+// Port of @mariozechner/pi-ai's internal `transformMessages` (not re-exported
+// from the package entry, so we carry a faithful copy). Does three things the
+// hand-rolled convertMessages below used to skip:
+//   1. drops/retains thinking blocks by same-model + signature rules,
+//   2. strips cross-model thoughtSignature on tool calls + normalizes IDs,
+//   3. synthesizes an empty `toolResult` for any orphaned tool_use (an
+//      assistant tool_call with no matching tool result), which otherwise
+//      makes the Anthropic API 400 on replay.
+// We DON'T degrade same-model no-signature thinking to text here — macaron
+// accepts signature-less thinking (see convertMessages note).
+function transformMessagesForMacaron(messages: Message[], model: Model<Api>): Message[] {
+	const toolCallIdMap = new Map<string, string>();
+	const norm = (id: string) => normalizeToolCallId(id);
+	const transformed = messages.map((msg): Message => {
+		if (msg.role !== "assistant") return msg;
+		const isSameModel = msg.provider === model.provider && msg.api === model.api && msg.model === model.id;
+		const content = msg.content.flatMap((block): any[] => {
+			if (block.type === "thinking") {
+				if ((block as ThinkingContent).redacted) return isSameModel ? [block] : [];
+				if (isSameModel && (block as ThinkingContent).thinkingSignature) return [block];
+				if (!block.thinking || block.thinking.trim() === "") return [];
+				if (isSameModel) return [block];
+				return [{ type: "text" as const, text: block.thinking }];
+			}
+			if (block.type === "text") return isSameModel ? [block] : [{ type: "text" as const, text: block.text }];
+			if (block.type === "toolCall") {
+				let tc: ToolCall = block;
+				if (!isSameModel) {
+					tc = { ...block };
+					delete (tc as any).thoughtSignature;
+				}
+				const nid = norm(tc.id);
+				if (nid !== tc.id) { toolCallIdMap.set(tc.id, nid); tc = { ...tc, id: nid }; }
+				return [tc];
+			}
+			return [block];
+		});
+		return { ...msg, content };
+	});
+
+	const result: Message[] = [];
+	let pendingToolCalls: ToolCall[] = [];
+	let existingResultIds = new Set<string>();
+	for (let i = 0; i < transformed.length; i++) {
+		const msg = transformed[i];
+		if (msg.role === "assistant") {
+			if (pendingToolCalls.length > 0) {
+				for (const tc of pendingToolCalls) {
+					if (!existingResultIds.has(tc.id)) {
+						result.push({
+							role: "toolResult",
+							toolCallId: tc.id,
+							toolName: tc.name,
+							content: [{ type: "text" as const, text: "No result provided" }],
+							isError: true,
+							timestamp: Date.now(),
+						} as ToolResultMessage);
+					}
+				}
+				pendingToolCalls = [];
+				existingResultIds = new Set<string>();
+			}
+			// Skip errored/aborted assistant turns entirely — replaying incomplete
+			// turns (partial thinking, dangling tool_use) causes API errors.
+			if (msg.stopReason === "error" || msg.stopReason === "aborted") continue;
+			const tcs = msg.content.filter((b): b is ToolCall => b.type === "toolCall");
+			if (tcs.length > 0) { pendingToolCalls = tcs; existingResultIds = new Set<string>(); }
+			result.push(msg);
+		} else if (msg.role === "toolResult") {
+			const nid = toolCallIdMap.get(msg.toolCallId);
+			const tr = nid && nid !== msg.toolCallId ? { ...msg, toolCallId: nid } : msg;
+			existingResultIds.add(tr.toolCallId);
+			result.push(tr);
+		} else {
+			if (pendingToolCalls.length > 0) {
+				for (const tc of pendingToolCalls) {
+					if (!existingResultIds.has(tc.id)) {
+						result.push({
+							role: "toolResult",
+							toolCallId: tc.id,
+							toolName: tc.name,
+							content: [{ type: "text" as const, text: "No result provided" }],
+							isError: true,
+							timestamp: Date.now(),
+						} as ToolResultMessage);
+					}
+				}
+				pendingToolCalls = [];
+				existingResultIds = new Set<string>();
+			}
+			result.push(msg);
+		}
+	}
+	return result;
+}
+
 function convertContentBlocks(content: (TextContent | ImageContent)[]) {
 	const hasImages = content.some((c) => c.type === "image");
 	if (!hasImages) {
@@ -83,7 +179,8 @@ function convertContentBlocks(content: (TextContent | ImageContent)[]) {
 	return blocks;
 }
 
-function convertMessages(messages: Message[]): any[] {
+function convertMessages(messages: Message[], model: Model<Api>): any[] {
+	messages = transformMessagesForMacaron(messages, model);
 	const params: any[] = [];
 	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i];
@@ -406,7 +503,7 @@ function streamMacaronWebSearch(
 			// build params (faithful to built-in buildParams, api-key path)
 			const params: any = {
 				model: model.id,
-				messages: convertMessages(context.messages),
+				messages: convertMessages(context.messages, model),
 				max_tokens: options?.maxTokens || Math.min(model.maxTokens || 32000, 32000),
 				stream: true,
 			};
