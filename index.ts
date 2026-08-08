@@ -252,7 +252,10 @@ function convertMessages(messages: Message[], model: Model<Api>): any[] {
 	// marker has NO effect (block-level auto cache ignores it), and marking the
 	// last user message made its position drift every turn anyway. See
 	// notes/pi-macaron-harness-cache-real-behavior.
-	return params;
+	// Canonicalize the whole payload (deep key sort) so key insertion-order
+	// drift from Pi core / model tool_use.input can't change the bytes sent —
+	// same semantic content always serializes identically (message stabilization).
+	return canonicalize(params);
 }
 
 function convertTools(tools: Tool[]): any[] {
@@ -328,6 +331,20 @@ function stableStringify(v: any): string {
 	if (Array.isArray(v)) return "[" + v.map(stableStringify).join(",") + "]";
 	const keys = Object.keys(v).sort();
 	return "{" + keys.map((k) => JSON.stringify(k) + ":" + stableStringify(v[k])).join(",") + "}";
+}
+
+// Deep-canonicalize an object tree: recursively sort object keys, returning a
+// new object. Arrays preserve order (semantically ordered). Used on the final
+// messages payload so that key insertion-order drift (from Pi core serialization,
+// model tool_use.input, etc.) cannot change the bytes sent to the API — same
+// semantic content always serializes identically. JSON object key order is
+// semantically irrelevant to the Anthropic API, so this is safe.
+function canonicalize(v: any): any {
+	if (v === null || typeof v !== "object") return v;
+	if (Array.isArray(v)) return v.map(canonicalize);
+	const out: Record<string, any> = {};
+	for (const k of Object.keys(v).sort()) out[k] = canonicalize(v[k]);
+	return out;
 }
 
 type SegmentKind = "system" | "tool" | "message";
@@ -697,7 +714,8 @@ function streamMacaronWebSearch(
 			if (context.systemPrompt) {
 				// cache_control omitted: measured to have NO effect on the macaron endpoint
 				// (block-level auto cache ignores the marker; see cache-affinity notes).
-				params.system = [{ type: "text", text: sanitizeSurrogates(context.systemPrompt) }];
+				// Canonicalize so the system block bytes are stable across turns.
+				params.system = canonicalize([{ type: "text", text: sanitizeSurrogates(context.systemPrompt) }]);
 			}
 			if (options?.temperature !== undefined && !(options?.reasoning && model.reasoning)) {
 				params.temperature = options.temperature;
@@ -708,7 +726,9 @@ function streamMacaronWebSearch(
 			// Re-sort the merged array: server tools + client tools must be in a stable
 			// order across turns or the cache prefix breaks (measured on the endpoint).
 			toolsArr.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-			params.tools = toolsArr;
+			// Deep-canonicalize each tool so nested schema/input_schema key order can't
+			// drift across turns (measured: key-order change breaks the tools prefix).
+			params.tools = toolsArr.map((t) => canonicalize(t));
 
 			if (model.reasoning) {
 				if (options?.reasoning) {
