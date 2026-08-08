@@ -107,14 +107,21 @@ function convertMessages(messages: Message[]): any[] {
 				if (block.type === "text" && block.text.trim()) {
 					blocks.push({ type: "text", text: sanitizeSurrogates(block.text) });
 				} else if (block.type === "thinking") {
+					// The macaron endpoint streams thinking blocks but never emits a
+					// `signature_delta`, so thinkingSignature is almost always empty.
+					// Real Anthropic would REJECT a thinking block without a valid
+					// signature and would require degrading to plain text here; but the
+					// macaron endpoint ACCEPTS a signature-less thinking block
+					// (verified), so we pass it back as `thinking` to keep the
+					// thinking/text distinction intact instead of leaking the model's
+					// prior reasoning into the visible assistant text.
 					if ((block as ThinkingContent).redacted) {
 						blocks.push({ type: "redacted_thinking", data: (block as ThinkingContent).thinkingSignature });
 					} else if (block.thinking.trim()) {
-						if ((block as ThinkingContent).thinkingSignature) {
-							blocks.push({ type: "thinking", thinking: sanitizeSurrogates(block.thinking), signature: (block as ThinkingContent).thinkingSignature });
-						} else {
-							blocks.push({ type: "text", text: sanitizeSurrogates(block.thinking) });
-						}
+						const sig = (block as ThinkingContent).thinkingSignature;
+						blocks.push(sig
+							? { type: "thinking", thinking: sanitizeSurrogates(block.thinking), signature: sig }
+							: { type: "thinking", thinking: sanitizeSurrogates(block.thinking) });
 					}
 				} else if (block.type === "toolCall") {
 					blocks.push({ type: "tool_use", id: normalizeToolCallId(block.id), name: block.name, input: block.arguments ?? {} });
