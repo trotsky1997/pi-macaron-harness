@@ -274,9 +274,24 @@ function convertTools(tools: Tool[]): any[] {
 // tools dominate the head). cache_control markers may be ignored by the shim,
 // so the reliable lever is keeping the prefix byte-stable across turns.
 //
-// We hash ONLY system prompt + tool definitions (not conversation history /
-// tool calls — those grow every turn and hashing them made the stability
-// indicator permanently red even at 98% hit ratio, per the reasonix writeup).
+// We model the request as a SEGMENT HASH TREE: a preorder flattening of the
+// request into ordered segments [system, tool0, tool1, ..., msg0, msg1, ...].
+// Each segment is hashed independently (djb2). A segment is a tree leaf; the
+// preorder traversal is the array. The tree structure classifies the break:
+// the first divergent index vs the previous turn's array is the BREAK POINT,
+// and its position as a fraction of total segments maps to front/mid/tail
+// (front = system/tools region, the silent killer; tail = new user turn,
+// benign; mid = message-layer instability). This covers the blind spot of
+// the old single prefixHash, which only saw system+tools and was blind to
+// message-layer drift (hazard 1: orphan toolResult synth; hazard 2:
+// cache_control marker relocation).
+//
+// Segment hashes are NOT prefixed through ancestors (no Merkle parent hash):
+// a parent hash would propagate any child change to the root, destroying
+// location info. We keep the per-segment array precisely so the break point
+// is recoverable. The "tree" is the request's natural structure; the array
+// is its preorder trace used for comparison.
+//
 // Usage fields (cacheRead/cacheWrite) are accumulated for a live hit-rate.
 
 function shortHash(s: string): string {
@@ -286,10 +301,75 @@ function shortHash(s: string): string {
 	return (h >>> 0).toString(36);
 }
 
-function prefixHash(params: any): string {
-	const sys = params.system ? JSON.stringify(params.system) : "";
-	const tools = params.tools ? JSON.stringify(params.tools.map((t: any) => ({ n: t.name, s: JSON.stringify(t.input_schema ?? t) }))) : "";
-	return shortHash(sys + "|" + tools);
+type SegmentKind = "system" | "tool" | "message";
+interface Segment {
+	kind: SegmentKind;
+	label: string; // human-readable id for break-point reporting
+	hash: string;
+}
+
+// Flatten a request params object into an ordered segment array (preorder).
+// Order matters: system first, then tools (schema-stable across turns), then
+// messages (append-mostly, but mid-message inserts/deletes are the hazard).
+function buildSegments(params: any): Segment[] {
+	const segs: Segment[] = [];
+	if (params.system) segs.push({ kind: "system", label: "system", hash: shortHash(JSON.stringify(params.system)) });
+	if (Array.isArray(params.tools)) {
+		for (let i = 0; i < params.tools.length; i++) {
+			const t = params.tools[i];
+			segs.push({ kind: "tool", label: `tool[${i}]:${t.name || "?"}`, hash: shortHash(JSON.stringify({ n: t.name, s: t.input_schema ?? t })) });
+		}
+	}
+	if (Array.isArray(params.messages)) {
+		for (let i = 0; i < params.messages.length; i++) {
+			const m = params.messages[i];
+			// hash role + content shape; skip volatile fields like cache_control
+			const lite = { role: m.role, content: m.content };
+			segs.push({ kind: "message", label: `msg[${i}]:${m.role}`, hash: shortHash(JSON.stringify(lite)) });
+		}
+	}
+	return segs;
+}
+
+// Longest common prefix between two segment hash arrays. Returns the index of
+// the first divergence (= number of stable leading segments) or -1 if none.
+// Growth at the tail (new segments appended) does NOT count as a break.
+function commonPrefixLen(a: Segment[], b: Segment[]): number {
+	const n = Math.min(a.length, b.length);
+	for (let i = 0; i < n; i++) if (a[i].hash !== b[i].hash) return i;
+	return n; // all shared segments match (one may be longer — pure append)
+}
+
+type BreakCategory = "none" | "first" | "front" | "mid" | "tail";
+const TAIL_RATIO = 0.10;
+
+function classifyBreak(breakIdx: number, prevSegs: Segment[], curSegs: Segment[]): BreakCategory {
+	if (curSegs.length === 0) return "none";
+	const shared = breakIdx;
+	const prevLen = prevSegs.length, curLen = curSegs.length;
+	// True divergence inside the shared region (not pure append).
+	if (shared < prevLen && shared < curLen) {
+		// The segment that DIVERGED lives at prevSegs[shared]; if it was a head
+		// segment (system/tool), the cache head broke = front (silent killer).
+		const diverged = prevSegs[shared];
+		if (diverged && diverged.kind !== "message") return "front";
+		// tail = break in the last TAIL_RATIO of the current request — new user
+		// turn near the end, benign. mid = message-layer instability elsewhere.
+		if (shared > curLen * (1 - TAIL_RATIO)) return "tail";
+		return "mid";
+	}
+	// shared === min(prevLen, curLen): all shared segments match; difference is
+	// only at the tail (one array longer than the other) — benign append/shrink.
+	return "tail";
+}
+
+interface PrefixAnalysis {
+	rootHash: string; // djb2 over all segment hashes joined (change-detection root)
+	segments: Segment[]; // full preorder array for next-turn comparison
+	breakIdx: number; // common prefix length vs previous turn (-1 if none)
+	breakCategory: BreakCategory;
+	breakLabel: string; // label of the first divergent segment, or "(appended)"
+	stable: boolean; // breakIdx covers all shared segments (pure append or identical)
 }
 
 const cacheStats = {
@@ -301,8 +381,44 @@ const cacheStats = {
 	prefixUnstableCount: 0,
 	lastPrefixHash: "",
 	lastStable: false,
-	reset() { this.turns = 0; this.hitTokens = 0; this.missTokens = 0; this.writeTokens = 0; this.prefixStableCount = 0; this.prefixUnstableCount = 0; },
+	lastBreakCategory: "first" as BreakCategory,
+	lastBreakLabel: "(first turn)",
+	lastBreakIdx: 0,
+	lastSegmentCount: 0,
+	_prevSegments: null as Segment[] | null,
+	reset() { this.turns = 0; this.hitTokens = 0; this.missTokens = 0; this.writeTokens = 0; this.prefixStableCount = 0; this.prefixUnstableCount = 0; this.lastPrefixHash = ""; this.lastStable = false; this.lastBreakCategory = "first"; this.lastBreakLabel = "(first turn)"; this.lastBreakIdx = 0; this.lastSegmentCount = 0; this._prevSegments = null; },
 };
+
+// Analyze a request's prefix stability vs the previous turn. Mutates cacheStats
+// with break category/label and the rolling root hash.
+function analyzePrefix(params: any): void {
+	const segs = buildSegments(params);
+	const root = shortHash(segs.map((s) => s.hash).join("|"));
+	let breakIdx = -1, category: BreakCategory = "first", label = "(first turn)", stable = false;
+	if (cacheStats._prevSegments && cacheStats._prevSegments.length > 0) {
+		breakIdx = commonPrefixLen(cacheStats._prevSegments, segs);
+		const shared = breakIdx;
+		category = classifyBreak(shared, cacheStats._prevSegments, segs);
+		if (shared < segs.length) {
+			label = segs[shared]?.label ?? "(end)";
+		} else {
+			// shared == segs.length: prev was a prefix of current (pure append) or identical
+			label = cacheStats._prevSegments.length === segs.length ? "(identical)" : "(appended)";
+		}
+		// stable = all shared segments match AND the break is only tail growth, not mid/front change.
+		// tail = new user turn at the end (benign); front/mid = real instability.
+		stable = category === "tail" || category === "none" || (shared === segs.length && cacheStats._prevSegments.length <= segs.length);
+	}
+	cacheStats.turns++;
+	cacheStats.lastPrefixHash = root;
+	cacheStats.lastSegmentCount = segs.length;
+	cacheStats.lastBreakIdx = breakIdx;
+	cacheStats.lastBreakCategory = category;
+	cacheStats.lastBreakLabel = label;
+	cacheStats.lastStable = stable;
+	if (stable) cacheStats.prefixStableCount++; else cacheStats.prefixUnstableCount++;
+	cacheStats._prevSegments = segs;
+}
 
 function mapStopReason(reason: string): StopReason {
 	switch (reason) {
@@ -577,11 +693,7 @@ function streamMacaronWebSearch(
 			const finalParams = nextParams !== undefined ? nextParams : params;
 
 			if (_isCacheWatch) {
-				const h = prefixHash(finalParams);
-				cacheStats.turns++;
-				if (cacheStats.lastPrefixHash === h) { cacheStats.prefixStableCount++; cacheStats.lastStable = true; }
-				else { cacheStats.prefixUnstableCount++; cacheStats.lastStable = false; }
-				cacheStats.lastPrefixHash = h;
+				analyzePrefix(finalParams);
 			}
 
 			const anthropicStream = client.messages.stream({ ...finalParams, stream: true }, { signal: options?.signal });
@@ -993,18 +1105,22 @@ export default function (pi: ExtensionAPI) {
 				const total = cacheStats.hitTokens + cacheStats.missTokens;
 				const ratio = total > 0 ? (cacheStats.hitTokens / total * 100) : 0;
 				const stable = cacheStats.lastStable;
+				const cat = cacheStats.lastBreakCategory;
+				const catSym: Record<BreakCategory, string> = { none: "✓", first: "·", front: "⚡", mid: "◳", tail: "✓" };
 				const lines = [
 					`macaron prefix-cache (Pillar 1)`,
 					`  Turns:           ${cacheStats.turns}`,
-					`  Prefix hash:     ${cacheStats.lastPrefixHash || "(none)"}`,
-					`  Prefix stable:   ${stable ? "yes" : "NO (prefix changed)"}  (${cacheStats.prefixStableCount}/${cacheStats.turns})`,
+					`  Root hash:       ${cacheStats.lastPrefixHash || "(none)"}`,
+					`  Segments:        ${cacheStats.lastSegmentCount}`,
+					`  Break point:     ${catSym[cat]} ${cat} @ ${cacheStats.lastBreakIdx}/${cacheStats.lastSegmentCount}  → ${cacheStats.lastBreakLabel}`,
+					`  Prefix stable:   ${stable ? "yes" : "NO"}  (${cacheStats.prefixStableCount}/${cacheStats.turns})`,
 					``,
 					`  Cache hit tokens:   ${cacheStats.hitTokens.toLocaleString()}`,
 					`  Cache miss tokens:  ${cacheStats.missTokens.toLocaleString()}`,
 					`  Cache write tokens: ${cacheStats.writeTokens.toLocaleString()}`,
 					`  Hit ratio:          ${ratio.toFixed(1)}%`,
 				];
-				if (ctx?.hasUI) ctx.ui.notify(`cache ${ratio.toFixed(0)}% hit, prefix ${stable ? "stable" : "UNSTABLE"}`, stable ? "success" : "warning");
+				if (ctx?.hasUI) ctx.ui.notify(`cache ${ratio.toFixed(0)}% hit, ${catSym[cat]} ${cat}${stable ? "" : " UNSTABLE"}`, stable ? "success" : "warning");
 				return { content: [{ type: "text", text: lines.join("\n") }] };
 			},
 		});
