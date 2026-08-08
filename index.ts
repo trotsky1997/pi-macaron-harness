@@ -23,6 +23,7 @@
  *   PI_WEBSEARCH_ALLOWED_DOMAINS     -> comma-separated, optional
  *   PI_WEBSEARCH_BLOCKED_DOMAINS      -> comma-separated, optional
  *   PI_MACARON_PROVIDER              -> provider name to wrap (default macaron-anthropic)
+ *   PI_MACARON_CACHE_STATUS=0         -> disable the /macaron-cache-status command
  */
 
 import Anthropic from "@anthropic-ai/sdk";
@@ -264,6 +265,45 @@ function convertTools(tools: Tool[]): any[] {
 	}));
 }
 
+// ---------------------------------------------------------------------------
+// Pillar 1: prefix-cache stability tracking + /macaron-cache-status
+// ---------------------------------------------------------------------------
+//
+// The macaron endpoint is an Anthropic-protocol shim over a DeepSeek-style
+// backend whose disk cache keys on a byte-stable request prefix (system +
+// tools dominate the head). cache_control markers may be ignored by the shim,
+// so the reliable lever is keeping the prefix byte-stable across turns.
+//
+// We hash ONLY system prompt + tool definitions (not conversation history /
+// tool calls — those grow every turn and hashing them made the stability
+// indicator permanently red even at 98% hit ratio, per the reasonix writeup).
+// Usage fields (cacheRead/cacheWrite) are accumulated for a live hit-rate.
+
+function shortHash(s: string): string {
+	// djb2 — no dependency, ~7 chars, collision-free for this use (change detection)
+	let h = 5381;
+	for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+	return (h >>> 0).toString(36);
+}
+
+function prefixHash(params: any): string {
+	const sys = params.system ? JSON.stringify(params.system) : "";
+	const tools = params.tools ? JSON.stringify(params.tools.map((t: any) => ({ n: t.name, s: JSON.stringify(t.input_schema ?? t) }))) : "";
+	return shortHash(sys + "|" + tools);
+}
+
+const cacheStats = {
+	turns: 0,
+	hitTokens: 0,
+	missTokens: 0,
+	writeTokens: 0,
+	prefixStableCount: 0,
+	prefixUnstableCount: 0,
+	lastPrefixHash: "",
+	lastStable: false,
+	reset() { this.turns = 0; this.hitTokens = 0; this.missTokens = 0; this.writeTokens = 0; this.prefixStableCount = 0; this.prefixUnstableCount = 0; },
+};
+
 function mapStopReason(reason: string): StopReason {
 	switch (reason) {
 		case "end_turn":
@@ -481,6 +521,8 @@ function streamMacaronWebSearch(
 			const apiKey = options?.apiKey ?? process.env.ANTHROPIC_AUTH_TOKEN ?? "";
 			if (!apiKey) throw new Error(`No API key for provider: ${model.provider}`);
 
+			const _isCacheWatch = process.env.PI_MACARON_CACHE_STATUS !== "0";
+
 			const betaFeatures = ["fine-grained-tool-streaming-2025-05-14", "interleaved-thinking-2025-05-14"];
 			// macaron (and any provider with authHeader:true) expects
 			// Authorization: Bearer, not x-api-key. The Anthropic SDK uses
@@ -533,6 +575,14 @@ function streamMacaronWebSearch(
 			// honor onPayload if a higher layer wants to inspect/replace
 			const nextParams = await (options as any)?.onPayload?.(params, model);
 			const finalParams = nextParams !== undefined ? nextParams : params;
+
+			if (_isCacheWatch) {
+				const h = prefixHash(finalParams);
+				cacheStats.turns++;
+				if (cacheStats.lastPrefixHash === h) { cacheStats.prefixStableCount++; cacheStats.lastStable = true; }
+				else { cacheStats.prefixUnstableCount++; cacheStats.lastStable = false; }
+				cacheStats.lastPrefixHash = h;
+			}
 
 			const anthropicStream = client.messages.stream({ ...finalParams, stream: true }, { signal: options?.signal });
 			stream.push({ type: "start", partial: output });
@@ -630,6 +680,11 @@ function streamMacaronWebSearch(
 					if (u.output_tokens != null) output.usage.output = u.output_tokens;
 					if (u.cache_read_input_tokens != null) output.usage.cacheRead = u.cache_read_input_tokens;
 					if (u.cache_creation_input_tokens != null) output.usage.cacheWrite = u.cache_creation_input_tokens;
+					if (_isCacheWatch) {
+						cacheStats.hitTokens += output.usage.cacheRead;
+						cacheStats.missTokens += output.usage.input;
+						cacheStats.writeTokens += output.usage.cacheWrite;
+					}
 					output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 					calculateCost(model, output.usage);
 				}
@@ -921,4 +976,37 @@ export default function (pi: ExtensionAPI) {
 			return { content: [{ type: "text", text: lines.join("\n") }] };
 		},
 	});
+
+	// /macaron-cache-status: prefix-cache stability + hit-rate (Pillar 1).
+	//   /macaron-cache-status         -> show stats
+	//   /macaron-cache-status reset   -> zero counters
+	if (process.env.PI_MACARON_CACHE_STATUS !== "0") {
+		pi.registerCommand("macaron-cache-status", {
+			description: "Prefix-cache stability + hit-rate stats (arg: reset)",
+			handler: async (args, ctx) => {
+				const arg = (args || "").trim().toLowerCase();
+				if (arg === "reset" || arg === "clear") {
+					cacheStats.reset();
+					if (ctx?.hasUI) ctx.ui.notify("macaron cache stats reset", "info");
+					return { content: [{ type: "text", text: "Counters reset." }] };
+				}
+				const total = cacheStats.hitTokens + cacheStats.missTokens;
+				const ratio = total > 0 ? (cacheStats.hitTokens / total * 100) : 0;
+				const stable = cacheStats.lastStable;
+				const lines = [
+					`macaron prefix-cache (Pillar 1)`,
+					`  Turns:           ${cacheStats.turns}`,
+					`  Prefix hash:     ${cacheStats.lastPrefixHash || "(none)"}`,
+					`  Prefix stable:   ${stable ? "yes" : "NO (prefix changed)"}  (${cacheStats.prefixStableCount}/${cacheStats.turns})`,
+					``,
+					`  Cache hit tokens:   ${cacheStats.hitTokens.toLocaleString()}`,
+					`  Cache miss tokens:  ${cacheStats.missTokens.toLocaleString()}`,
+					`  Cache write tokens: ${cacheStats.writeTokens.toLocaleString()}`,
+					`  Hit ratio:          ${ratio.toFixed(1)}%`,
+				];
+				if (ctx?.hasUI) ctx.ui.notify(`cache ${ratio.toFixed(0)}% hit, prefix ${stable ? "stable" : "UNSTABLE"}`, stable ? "success" : "warning");
+				return { content: [{ type: "text", text: lines.join("\n") }] };
+			},
+		});
+	}
 }
