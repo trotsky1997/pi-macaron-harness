@@ -123,7 +123,10 @@ function transformMessagesForMacaron(messages: Message[], model: Model<Api>): Me
 							toolName: tc.name,
 							content: [{ type: "text" as const, text: "No result provided" }],
 							isError: true,
-							timestamp: Date.now(),
+							// Fixed timestamp: this is a synthetic placeholder, not a real
+							// event. Date.now() would make every replay byte-different and
+							// pollute the message-layer prefix hash (stabilization).
+							timestamp: 0,
 						} as ToolResultMessage);
 					}
 				}
@@ -151,7 +154,8 @@ function transformMessagesForMacaron(messages: Message[], model: Model<Api>): Me
 							toolName: tc.name,
 							content: [{ type: "text" as const, text: "No result provided" }],
 							isError: true,
-							timestamp: Date.now(),
+							// Fixed timestamp (see note above): stabilization.
+							timestamp: 0,
 						} as ToolResultMessage);
 					}
 				}
@@ -252,16 +256,29 @@ function convertMessages(messages: Message[], model: Model<Api>): any[] {
 }
 
 function convertTools(tools: Tool[]): any[] {
-	// Sort tools by name for byte-stable tools-array prefix. Measured on the
-	// macaron endpoint: tools array ORDER swap breaks the cache (cacheRead→0),
-	// while system/message-layer changes do not. Pi core may deliver context.tools
-	// in a different order across turns, so we normalize here.
+	// Stabilize the tools array for byte-prefix caching. Measured on the
+	// macaron endpoint (4 probe batches): tools changes break the cache hard —
+	// order swap, count add/remove (even tail append), 1-char description change,
+	// and schema properties KEY ORDER all drive cacheRead to 0. So we normalize:
+	// (1) sort tools by name, (2) emit properties with canonical sorted keys,
+	// (3) stable required[] order. system also breaks (prefix-truncated) but
+	// Pi core sends a stable systemPrompt; messages do NOT participate in the
+	// cache key at all, so we leave them alone.
 	return tools
-		.map((tool) => ({
-			name: tool.name,
-			description: tool.description,
-			input_schema: { type: "object", properties: (tool.parameters as any).properties || {}, required: (tool.parameters as any).required || [] },
-		}))
+		.map((tool) => {
+			const propsIn = (tool.parameters as any).properties || {};
+			// Canonicalize property key order so tool-author / Pi-core key-order
+			// drift doesn't invalidate the tools prefix.
+			const propsOut: Record<string, any> = {};
+			for (const k of Object.keys(propsIn).sort()) propsOut[k] = propsIn[k];
+			const requiredIn = (tool.parameters as any).required || [];
+			const requiredOut = Array.isArray(requiredIn) ? [...requiredIn].sort() : requiredIn;
+			return {
+				name: tool.name,
+				description: tool.description,
+				input_schema: { type: "object", properties: propsOut, required: requiredOut },
+			};
+		})
 		.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
@@ -301,6 +318,18 @@ function shortHash(s: string): string {
 	return (h >>> 0).toString(36);
 }
 
+// Canonical JSON: recursively sort object keys so semantically-equal payloads
+// with different key insertion order hash identically. Used by buildSegments so
+// message-layer objects ({type,text} vs {type,text,signature}) that differ only
+// in key order don't produce false "mid" break signals in the hash tree.
+// Arrays preserve order (they're semantically ordered).
+function stableStringify(v: any): string {
+	if (v === null || typeof v !== "object") return JSON.stringify(v);
+	if (Array.isArray(v)) return "[" + v.map(stableStringify).join(",") + "]";
+	const keys = Object.keys(v).sort();
+	return "{" + keys.map((k) => JSON.stringify(k) + ":" + stableStringify(v[k])).join(",") + "}";
+}
+
 type SegmentKind = "system" | "tool" | "message";
 interface Segment {
 	kind: SegmentKind;
@@ -325,7 +354,7 @@ function buildSegments(params: any): Segment[] {
 			const m = params.messages[i];
 			// hash role + content shape; skip volatile fields like cache_control
 			const lite = { role: m.role, content: m.content };
-			segs.push({ kind: "message", label: `msg[${i}]:${m.role}`, hash: shortHash(JSON.stringify(lite)) });
+			segs.push({ kind: "message", label: `msg[${i}]:${m.role}`, hash: shortHash(stableStringify(lite)) });
 		}
 	}
 	return segs;
