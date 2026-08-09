@@ -847,6 +847,13 @@ function streamMacaronWebSearch(
 						}
 						delete block.partialJson;
 					}
+						// pi's TUI appends text on `text_delta` events; `text_end` only finalizes.
+						// srvResult blocks never emitted a text_delta (content arrived as server-tool
+						// JSON deltas), so push the full formatted text as a final text_delta now,
+						// then finalize with text_end — otherwise the TUI renders an empty block.
+					if (block.kind === "srvResult" && block.text) {
+						stream.push({ type: "text_delta", contentIndex: idx, delta: block.text, partial: output });
+					}
 					if (block.kind === "text" || block.kind === "srvResult") {
 						stream.push({ type: "text_end", contentIndex: idx, content: block.text, partial: output });
 					} else if (block.kind === "thinking") {
