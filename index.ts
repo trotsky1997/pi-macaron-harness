@@ -51,9 +51,10 @@ import { Type } from "@mariozechner/pi-ai";
 import TurndownService from "turndown";
 import { Readability } from "@mozilla/readability";
 import { JSDOM } from "jsdom";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 
 // ---------------------------------------------------------------------------
 // helpers (mirror the built-in anthropic provider so behavior stays faithful
@@ -993,7 +994,9 @@ function cacheSet(key: string, body: string) {
 	}
 }
 
-/** Fetch + convert to Markdown (no truncation, no grep). Cached. */
+/** Fetch + convert to Markdown (no truncation, no grep). Cached.
+ *  Skill URLs (/skills/ or SKILL.md) skip Readability and keep the raw
+ *  body verbatim, since Readability mangles frontmatter/ fenced code. */
 async function fetchBody(url: string, keepImages: boolean, keepLinks: boolean): Promise<string> {
 	const key = cacheKey(url, keepImages, keepLinks);
 	const hit = cacheGet(key);
@@ -1009,7 +1012,7 @@ async function fetchBody(url: string, keepImages: boolean, keepLinks: boolean): 
 	const ctype = (res.headers.get("content-type") || "").toLowerCase();
 	const raw = await res.text();
 	let body: string;
-	if (ctype.includes("application/json") || ctype.includes("text/plain")) {
+	if (isSkillUrl(url) || ctype.includes("application/json") || ctype.includes("text/plain")) {
 		body = raw;
 	} else {
 		body = htmlToMarkdown(raw, url, keepImages, keepLinks);
@@ -1023,6 +1026,32 @@ async function fetchUrl(url: string, maxLength: number, keepImages: boolean, kee
 	let body = await fetchBody(url, keepImages, keepLinks);
 	if (body.length > maxLength) body = body.slice(0, maxLength) + `\n…[truncated ${body.length - maxLength} chars]`;
 	return body;
+}
+
+// True if the URL points at a skill document: contains /skills/ or SKILL.md.
+// These are fetched verbatim (no Readability) and saved to disk so the agent
+// can read the full content via the returned path.
+function isSkillUrl(url: string): boolean {
+	return /\/skills\/|SKILL\.md/i.test(url);
+}
+
+// Save a fetched skill body to <cwd>/.pi/webfetch/<hash>.md and return the
+// path. The file holds the full, untruncated content; the inline tool result
+// may still be truncated to max_length. Returns undefined on failure.
+function saveSkillBody(url: string, body: string): string | undefined {
+	try {
+		const dir = join(process.cwd(), ".pi", "webfetch");
+		mkdirSync(dir, { recursive: true });
+		const hash = createHash("sha1").update(url).digest("hex").slice(0, 16);
+		// ponytail: 16-hex hash + short slug for human browsing; collisions across
+		// distinct skill URLs are negligible at this width.
+		const slug = url.replace(/^https?:\/\//, "").replace(/[\/\?#][^A-Za-z0-9.-]+/g, "_").slice(0, 40).replace(/[^A-Za-z0-9._-]/g, "");
+		const file = join(dir, `${hash}-${slug || "skill"}.md`);
+		writeFileSync(file, `Source: ${url}\n\n${body}`, "utf8");
+		return file;
+	} catch {
+		return undefined;
+	}
 }
 
 /** Grep the fetched body: keep only matching lines. Pattern is treated as
@@ -1042,8 +1071,8 @@ const clientWebFetchTool = defineTool({
 	name: "web_fetch",
 	label: "Web Fetch (client-side)",
 	description:
-		"Fetch a single URL and return its text content (HTML is converted to clean Markdown via Readability+Turndown). Responses are cached in-memory (LRU+TTL) keyed by url+keep_images+keep_links, so repeated calls with different grep/max_length reuse one fetch. By default images and link URLs are stripped (anchor text kept) to save tokens — set keep_images=true and/or keep_links=true to preserve them. Optional grep pattern keeps only matching lines of the fetched body. Returns the (grep-filtered) body text, truncated to max_length.",
-	promptSnippet: "web_fetch(url, grep?, keep_images?, keep_links?): fetch a URL, optionally grep-filter and control media/link stripping.",
+		"Fetch a single URL and return its text content (HTML is converted to clean Markdown via Readability+Turndown). Responses are cached in-memory (LRU+TTL) keyed by url+keep_images+keep_links, so repeated calls with different grep/max_length reuse one fetch. By default images and link URLs are stripped (anchor text kept) to save tokens — set keep_images=true and/or keep_links=true to preserve them. Optional grep pattern keeps only matching lines of the fetched body. Skill URLs (/skills/ or SKILL.md) are fetched verbatim (no Readability) and saved to <cwd>/.pi/webfetch/<hash>.md with the full content; the path is returned inline and in details.savedPath, and the inline copy is truncated to max_length.",
+	promptSnippet: "web_fetch(url, grep?, keep_images?, keep_links?): fetch a URL, optionally grep-filter and control media/link stripping. Skill (SKILL.md / /skills/) content is saved verbatim to .pi/webfetch/<hash>.md; inline copy truncated to max_length.",
 	parameters: Type.Object({
 		url: Type.String({ description: "The absolute URL to fetch (http/https)." }),
 		max_length: Type.Optional(Type.Number({ description: "Max chars to return (default 8000)." })),
@@ -1056,6 +1085,21 @@ const clientWebFetchTool = defineTool({
 			const max = params.max_length ?? Number(process.env.PI_WEBFETCH_MAX_CHARS ?? 8000);
 			const keepImages = params.keep_images ?? envFlag("PI_WEBFETCH_KEEP_IMAGES", false);
 			const keepLinks = params.keep_links ?? envFlag("PI_WEBFETCH_KEEP_LINKS", false);
+			const skill = isSkillUrl(params.url);
+			if (skill) {
+				// Skill docs: fetch the full raw body, save it to disk so the
+				// agent can read the complete content via the path, and inline
+				// the body truncated to max_length (or in full if shorter).
+				const full = await fetchBody(params.url, keepImages, keepLinks);
+				const savedPath = saveSkillBody(params.url, full);
+				let body = params.grep ? grepFilter(full, params.grep) : full;
+				const truncated = body.length > max;
+				if (truncated) body = body.slice(0, max) + `\n…[truncated ${body.length - max} chars]`;
+				if (savedPath) {
+					body += `\n\n[full skill content saved: ${savedPath}${truncated ? " — read the file for the truncated tail" : ""}]`;
+				}
+				return { content: [{ type: "text" as const, text: body }], details: { url: params.url, length: body.length, keep_images: keepImages, keep_links: keepLinks, grep: params.grep, savedPath } as any };
+			}
 			let body = await fetchUrl(params.url, max, keepImages, keepLinks);
 			if (params.grep) {
 				body = grepFilter(body, params.grep);
