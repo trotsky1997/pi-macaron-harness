@@ -836,6 +836,17 @@ function streamMacaronWebSearch(
 					const block = blocks[idx];
 					if (!block) continue;
 					delete block.index;
+					if (block.kind === "srvResult" && block.partialJson) {
+						// Re-parse the accumulated server-tool delta JSON and re-format now that
+						// the full result has streamed in (at content_block_start it looked empty).
+						try {
+							const parsed = JSON.parse(block.partialJson);
+							block.text = formatServerResult(parsed);
+						} catch {
+							// not complete JSON yet; keep the start-time text (raw dump)
+						}
+						delete block.partialJson;
+					}
 					if (block.kind === "text" || block.kind === "srvResult") {
 						stream.push({ type: "text_end", contentIndex: idx, content: block.text, partial: output });
 					} else if (block.kind === "thinking") {
