@@ -551,10 +551,6 @@ function cap(s: string): string {
 	return s.length > max ? s.slice(0, max) + `\n…[truncated ${s.length - max} chars]` : s;
 }
 
-// Tracks when each server-side tool call (by tool_use_id) started, so the
-// result block can report a wall-clock duration in its compact TUI line.
-const serverToolStartedAt = new Map<string, number>();
-
 function formatServerUse(name: string, input: any): string {
 	let detail = "";
 	if (name === "web_search" && input && typeof input.query === "string" && input.query.trim()) {
@@ -567,22 +563,30 @@ function formatServerUse(name: string, input: any): string {
 }
 
 function formatSearchResult(block: any): string {
-	// TUI-only summary line. The model sees the full web_search_tool_result
-	// block directly from the API (server-side tool); this text is just what
-	// pi renders on screen + stores in the assistant message trail. Keep it
-	// compact: status + duration + result count. No result bodies/titles.
+	// Anthropic spec: block.content is Array<WebSearchResultBlock> ({type, title, url, encrypted_content, page_age}).
+	// But the macaron proxy may return a different shape; never silently emit "(empty)"
+	// when the block actually carries data — dump a compact JSON fallback so the
+	// result is visible (and the real shape is debuggable) instead of dropped.
 	const results: any[] = Array.isArray(block?.content) ? block.content : [];
-	const count = results.length;
-	const id = block?.tool_use_id;
-	const startedAt = id ? serverToolStartedAt.get(id) : undefined;
-	if (id && startedAt) serverToolStartedAt.delete(id);
-	const dur = startedAt ? `${((Date.now() - startedAt) / 1000).toFixed(1)}s` : "?";
-	if (count === 0) {
-		// macaron endpoint sometimes returns a well-formed block with content:[] —
-		// it fed results to the model internally but returned none to the client.
-		return `\n[web_search_tool_result] done in ${dur} — endpoint returned 0 citable results\n`;
+	if (results.length === 0) {
+		const raw = (() => { try { return JSON.stringify(block); } catch { return String(block); } })();
+		return `\n[web_search_tool_result] (no parsed results; raw block:)\n${cap(raw)}\n`;
 	}
-	return `\n[web_search_tool_result] done in ${dur} — ${count} result${count === 1 ? "" : "s"}\n`;
+	const lines: string[] = ["\n[web_search_tool_result]"];
+	const shown = results.slice(0, 8);
+	for (let i = 0; i < shown.length; i++) {
+		const r = shown[i];
+		// accept both spec shape (title/url at top level) and nested
+		const item = r && typeof r === "object" && Array.isArray(r.content) && r.content[0]?.title ? r.content[0] : r;
+		const title = typeof item?.title === "string" ? item.title : "(untitled)";
+		const url = typeof item?.url === "string" ? item.url : "";
+		const page = typeof item?.page_number === "number" ? ` (p.${item.page_number})` : (typeof r?.page_number === "number" ? ` (p.${r.page_number})` : "");
+		lines.push(`  ${i + 1}. ${title}${page}`);
+		if (url) lines.push(`     ${url}`);
+	}
+	if (results.length > shown.length) lines.push(`  …and ${results.length - shown.length} more`);
+	lines.push("");
+	return lines.join("\n");
 }
 
 function formatWebFetchResult(block: any): string {
@@ -793,9 +797,7 @@ function streamMacaronWebSearch(
 						stream.push({ type: "toolcall_start", contentIndex: blocks.length - 1, partial: output });
 					} else if (cb.type === "server_tool_use") {
 						// render as text so pi can store/echo it
-						const suId = cb.id || cb.tool_use_id;
-						if (suId) serverToolStartedAt.set(suId, Date.now());
-						blocks.push({ type: "text", text: "", index: idx, kind: "srvUse", partialJson: cb.input ? JSON.stringify(cb.input) : "", srvName: cb.name || "server_tool", srvToolUseId: suId });
+						blocks.push({ type: "text", text: "", index: idx, kind: "srvUse", partialJson: cb.input ? JSON.stringify(cb.input) : "", srvName: cb.name || "server_tool" });
 						stream.push({ type: "text_start", contentIndex: blocks.length - 1, partial: output });
 					} else {
 						// Any other server-side result block (web_search_tool_result,
