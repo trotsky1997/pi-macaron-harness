@@ -563,15 +563,24 @@ function formatServerUse(name: string, input: any): string {
 }
 
 function formatSearchResult(block: any): string {
+	// Anthropic spec: block.content is Array<WebSearchResultBlock> ({type, title, url, encrypted_content, page_age}).
+	// But the macaron proxy may return a different shape; never silently emit "(empty)"
+	// when the block actually carries data — dump a compact JSON fallback so the
+	// result is visible (and the real shape is debuggable) instead of dropped.
 	const results: any[] = Array.isArray(block?.content) ? block.content : [];
-	if (results.length === 0) return `\n[web_search_tool_result] (empty)\n`;
+	if (results.length === 0) {
+		const raw = (() => { try { return JSON.stringify(block); } catch { return String(block); } })();
+		return `\n[web_search_tool_result] (no parsed results; raw block:)\n${cap(raw)}\n`;
+	}
 	const lines: string[] = ["\n[web_search_tool_result]"];
 	const shown = results.slice(0, 8);
 	for (let i = 0; i < shown.length; i++) {
 		const r = shown[i];
-		const title = typeof r?.title === "string" ? r.title : "(untitled)";
-		const url = typeof r?.url === "string" ? r.url : "";
-		const page = typeof r?.page_number === "number" ? ` (p.${r.page_number})` : "";
+		// accept both spec shape (title/url at top level) and nested
+		const item = r && typeof r === "object" && Array.isArray(r.content) && r.content[0]?.title ? r.content[0] : r;
+		const title = typeof item?.title === "string" ? item.title : "(untitled)";
+		const url = typeof item?.url === "string" ? item.url : "";
+		const page = typeof item?.page_number === "number" ? ` (p.${item.page_number})` : (typeof r?.page_number === "number" ? ` (p.${r.page_number})` : "");
 		lines.push(`  ${i + 1}. ${title}${page}`);
 		if (url) lines.push(`     ${url}`);
 	}
